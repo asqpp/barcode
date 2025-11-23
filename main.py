@@ -25,6 +25,10 @@ from barcode_manager import (
     generate_barcode_number, generate_ean13, create_barcode_image,
     create_barcode_label, create_barcode_pdf, print_barcode, get_available_printers
 )
+from receipt_manager import (
+    generate_receipt_text, save_receipt_text, generate_receipt_pdf,
+    print_receipt, print_receipt_to_thermal
+)
 
 class ERPApplication(tk.Tk):
     def __init__(self):
@@ -93,6 +97,7 @@ class ERPApplication(tk.Tk):
         self.products_tab = ttk.Frame(self.notebook)
         self.barcode_tab = ttk.Frame(self.notebook)
         self.purchases_tab = ttk.Frame(self.notebook)
+        self.payments_tab = ttk.Frame(self.notebook)
         self.customers_tab = ttk.Frame(self.notebook)
         self.suppliers_tab = ttk.Frame(self.notebook)
         self.accounting_tab = ttk.Frame(self.notebook)
@@ -102,6 +107,7 @@ class ERPApplication(tk.Tk):
         self.notebook.add(self.products_tab, text="Products")
         self.notebook.add(self.barcode_tab, text="Barcodes")
         self.notebook.add(self.purchases_tab, text="Purchases")
+        self.notebook.add(self.payments_tab, text="Payments")
         self.notebook.add(self.customers_tab, text="Customers")
         self.notebook.add(self.suppliers_tab, text="Suppliers")
         self.notebook.add(self.accounting_tab, text="Accounting")
@@ -112,6 +118,7 @@ class ERPApplication(tk.Tk):
         self.setup_products()
         self.setup_barcode()
         self.setup_purchases()
+        self.setup_payments()
         self.setup_customers()
         self.setup_suppliers()
         self.setup_accounting()
@@ -404,7 +411,47 @@ class ERPApplication(tk.Tk):
             # Record accounting entry
             record_sale(sale_id, total, total_cost, paid)
 
-        messagebox.showinfo("Success", f"Sale completed!\nInvoice: {invoice_no}\nChange: ${max(0, paid - total):.2f}")
+        # Generate receipt
+        customer_name = 'Walk-in Customer'
+        if customer_id:
+            customer = get_customer_by_id(customer_id)
+            if customer:
+                customer_name = customer['name']
+
+        sale_data = {
+            'invoice_no': invoice_no,
+            'date': str(date.today()),
+            'customer': customer_name,
+            'subtotal': subtotal,
+            'discount': discount,
+            'tax': tax,
+            'total': total,
+            'paid': paid
+        }
+
+        items_data = [{'name': item['name'], 'qty': item['qty'],
+                       'price': item['price'], 'total': item['total']}
+                      for item in self.cart]
+
+        # Save receipt
+        receipt_text = generate_receipt_text(sale_data, items_data)
+        receipt_path = save_receipt_text(receipt_text, invoice_no)
+
+        # Ask to print receipt
+        change = max(0, paid - total)
+        if messagebox.askyesno("Sale Complete",
+            f"Sale completed!\nInvoice: {invoice_no}\nChange: ${change:.2f}\n\nPrint receipt?"):
+            # Try PDF first, then text
+            pdf_path, error = generate_receipt_pdf(sale_data, items_data)
+            if pdf_path:
+                success, err = print_receipt(pdf_path)
+                if not success:
+                    messagebox.showwarning("Print Error", f"Could not print: {err}\nReceipt saved to {pdf_path}")
+            else:
+                # Print text receipt
+                success, err = print_receipt_to_thermal(receipt_text)
+                if not success:
+                    messagebox.showinfo("Receipt Saved", f"Receipt saved to {receipt_path}")
 
         # Clear cart
         self.clear_cart()
@@ -770,6 +817,83 @@ class ERPApplication(tk.Tk):
 
             messagebox.showinfo("Success", "Payment recorded")
             self.refresh_purchases()
+
+    # ==================== PAYMENTS ====================
+    def setup_payments(self):
+        frame = self.payments_tab
+
+        ttk.Label(frame, text="Payment Management", style='Title.TLabel').pack(pady=10)
+
+        # Toolbar
+        toolbar = ttk.Frame(frame)
+        toolbar.pack(fill=tk.X, pady=5)
+
+        ttk.Button(toolbar, text="Receive Payment", command=self.receive_payment_dialog).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="Make Payment", command=self.make_payment_dialog).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="Refresh", command=self.refresh_payments).pack(side=tk.LEFT, padx=2)
+
+        # Filter
+        filter_frame = ttk.Frame(frame)
+        filter_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        ttk.Label(filter_frame, text="Type:").pack(side=tk.LEFT)
+        self.payment_filter_var = tk.StringVar(value="All")
+        filter_combo = ttk.Combobox(filter_frame, textvariable=self.payment_filter_var,
+                                    values=['All', 'Received', 'Made'], width=15)
+        filter_combo.pack(side=tk.LEFT, padx=5)
+        filter_combo.bind('<<ComboboxSelected>>', lambda e: self.refresh_payments())
+
+        # Payments list
+        columns = ('id', 'type', 'date', 'amount', 'method', 'reference', 'notes')
+        self.payments_tree = ttk.Treeview(frame, columns=columns, show='headings')
+
+        for col in columns:
+            self.payments_tree.heading(col, text=col.title())
+        self.payments_tree.column('id', width=50)
+        self.payments_tree.column('type', width=100)
+        self.payments_tree.column('date', width=100)
+        self.payments_tree.column('amount', width=100)
+        self.payments_tree.column('method', width=100)
+        self.payments_tree.column('reference', width=120)
+        self.payments_tree.column('notes', width=200)
+
+        scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.payments_tree.yview)
+        self.payments_tree.configure(yscrollcommand=scrollbar.set)
+
+        self.payments_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.refresh_payments()
+
+    def refresh_payments(self):
+        self.payments_tree.delete(*self.payments_tree.get_children())
+        filter_type = self.payment_filter_var.get()
+
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            if filter_type == 'All':
+                cursor.execute('SELECT * FROM payments ORDER BY payment_date DESC, id DESC')
+            elif filter_type == 'Received':
+                cursor.execute('SELECT * FROM payments WHERE payment_type = "received" ORDER BY payment_date DESC')
+            else:
+                cursor.execute('SELECT * FROM payments WHERE payment_type = "made" ORDER BY payment_date DESC')
+
+            for row in cursor.fetchall():
+                self.payments_tree.insert('', 'end', values=(
+                    row['id'], row['payment_type'].title(), row['payment_date'],
+                    f"${row['amount']:.2f}", row['payment_method'], row['reference_type'] or '',
+                    row['notes'] or ''
+                ))
+
+    def receive_payment_dialog(self):
+        dialog = ReceivePaymentDialog(self)
+        self.wait_window(dialog)
+        self.refresh_payments()
+
+    def make_payment_dialog(self):
+        dialog = MakePaymentDialog(self)
+        self.wait_window(dialog)
+        self.refresh_payments()
 
     # ==================== CUSTOMERS ====================
     def setup_customers(self):
@@ -1494,6 +1618,224 @@ class BatchPrintDialog(tk.Toplevel):
                 self.destroy()
         else:
             messagebox.showwarning("Error", "Select at least one product")
+
+
+class ReceivePaymentDialog(tk.Toplevel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Receive Payment")
+        self.geometry("400x350")
+
+        frame = ttk.Frame(self)
+        frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # Customer selection
+        ttk.Label(frame, text="Customer:").grid(row=0, column=0, sticky='w', pady=5)
+        self.customer_var = tk.StringVar()
+        customer_combo = ttk.Combobox(frame, textvariable=self.customer_var, width=30)
+        customers = get_customers()
+        customer_combo['values'] = [f"{c['id']} - {c['name']}" for c in customers]
+        customer_combo.grid(row=0, column=1, pady=5)
+
+        # Amount
+        ttk.Label(frame, text="Amount:").grid(row=1, column=0, sticky='w', pady=5)
+        self.amount_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=self.amount_var, width=32).grid(row=1, column=1, pady=5)
+
+        # Payment method
+        ttk.Label(frame, text="Method:").grid(row=2, column=0, sticky='w', pady=5)
+        self.method_var = tk.StringVar(value="cash")
+        method_combo = ttk.Combobox(frame, textvariable=self.method_var, width=30,
+                                    values=['cash', 'card', 'bank transfer', 'check', 'other'])
+        method_combo.grid(row=2, column=1, pady=5)
+
+        # Reference (optional - link to invoice)
+        ttk.Label(frame, text="Invoice (optional):").grid(row=3, column=0, sticky='w', pady=5)
+        self.invoice_var = tk.StringVar()
+        invoice_combo = ttk.Combobox(frame, textvariable=self.invoice_var, width=30)
+        # Get unpaid/partial sales
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT invoice_no, total_amount, paid_amount FROM sales
+                WHERE status != 'paid' ORDER BY sale_date DESC
+            ''')
+            invoices = cursor.fetchall()
+        invoice_combo['values'] = [f"{i['invoice_no']} (Due: ${i['total_amount'] - i['paid_amount']:.2f})"
+                                   for i in invoices]
+        invoice_combo.grid(row=3, column=1, pady=5)
+
+        # Notes
+        ttk.Label(frame, text="Notes:").grid(row=4, column=0, sticky='w', pady=5)
+        self.notes_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=self.notes_var, width=32).grid(row=4, column=1, pady=5)
+
+        # Buttons
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(pady=10)
+        ttk.Button(btn_frame, text="Save Payment", command=self.save).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=self.destroy).pack(side=tk.LEFT)
+
+    def save(self):
+        customer_str = self.customer_var.get()
+        if not customer_str:
+            messagebox.showerror("Error", "Please select a customer")
+            return
+
+        try:
+            amount = float(self.amount_var.get())
+        except ValueError:
+            messagebox.showerror("Error", "Invalid amount")
+            return
+
+        if amount <= 0:
+            messagebox.showerror("Error", "Amount must be positive")
+            return
+
+        customer_id = int(customer_str.split(' - ')[0])
+
+        with get_connection() as conn:
+            cursor = conn.cursor()
+
+            # Record payment
+            cursor.execute('''
+                INSERT INTO payments (payment_type, reference_type, reference_id, amount,
+                                      payment_method, payment_date, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', ('received', 'customer', customer_id, amount, self.method_var.get(),
+                  date.today(), self.notes_var.get()))
+
+            # Update customer balance
+            cursor.execute('UPDATE customers SET balance = balance - ? WHERE id = ?',
+                          (amount, customer_id))
+
+            # If linked to invoice, update sale
+            invoice_str = self.invoice_var.get()
+            if invoice_str:
+                invoice_no = invoice_str.split(' ')[0]
+                cursor.execute('''
+                    UPDATE sales SET paid_amount = paid_amount + ? WHERE invoice_no = ?
+                ''', (amount, invoice_no))
+                cursor.execute('''
+                    UPDATE sales SET status = 'paid' WHERE invoice_no = ? AND paid_amount >= total_amount
+                ''', (invoice_no,))
+
+            conn.commit()
+
+            # Record accounting entry
+            record_payment_received(customer_id, amount, f'RCPT-{customer_id}')
+
+        messagebox.showinfo("Success", f"Payment of ${amount:.2f} received")
+        self.destroy()
+
+
+class MakePaymentDialog(tk.Toplevel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Make Payment")
+        self.geometry("400x350")
+
+        frame = ttk.Frame(self)
+        frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # Supplier selection
+        ttk.Label(frame, text="Supplier:").grid(row=0, column=0, sticky='w', pady=5)
+        self.supplier_var = tk.StringVar()
+        supplier_combo = ttk.Combobox(frame, textvariable=self.supplier_var, width=30)
+        suppliers = get_suppliers()
+        supplier_combo['values'] = [f"{s['id']} - {s['name']}" for s in suppliers]
+        supplier_combo.grid(row=0, column=1, pady=5)
+
+        # Amount
+        ttk.Label(frame, text="Amount:").grid(row=1, column=0, sticky='w', pady=5)
+        self.amount_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=self.amount_var, width=32).grid(row=1, column=1, pady=5)
+
+        # Payment method
+        ttk.Label(frame, text="Method:").grid(row=2, column=0, sticky='w', pady=5)
+        self.method_var = tk.StringVar(value="cash")
+        method_combo = ttk.Combobox(frame, textvariable=self.method_var, width=30,
+                                    values=['cash', 'card', 'bank transfer', 'check', 'other'])
+        method_combo.grid(row=2, column=1, pady=5)
+
+        # Reference (optional - link to purchase)
+        ttk.Label(frame, text="Purchase (optional):").grid(row=3, column=0, sticky='w', pady=5)
+        self.purchase_var = tk.StringVar()
+        purchase_combo = ttk.Combobox(frame, textvariable=self.purchase_var, width=30)
+        # Get unpaid/partial purchases
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT invoice_no, total_amount, paid_amount FROM purchases
+                WHERE status != 'paid' ORDER BY purchase_date DESC
+            ''')
+            purchases = cursor.fetchall()
+        purchase_combo['values'] = [f"{p['invoice_no']} (Due: ${p['total_amount'] - p['paid_amount']:.2f})"
+                                    for p in purchases]
+        purchase_combo.grid(row=3, column=1, pady=5)
+
+        # Notes
+        ttk.Label(frame, text="Notes:").grid(row=4, column=0, sticky='w', pady=5)
+        self.notes_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=self.notes_var, width=32).grid(row=4, column=1, pady=5)
+
+        # Buttons
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(pady=10)
+        ttk.Button(btn_frame, text="Save Payment", command=self.save).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=self.destroy).pack(side=tk.LEFT)
+
+    def save(self):
+        supplier_str = self.supplier_var.get()
+        if not supplier_str:
+            messagebox.showerror("Error", "Please select a supplier")
+            return
+
+        try:
+            amount = float(self.amount_var.get())
+        except ValueError:
+            messagebox.showerror("Error", "Invalid amount")
+            return
+
+        if amount <= 0:
+            messagebox.showerror("Error", "Amount must be positive")
+            return
+
+        supplier_id = int(supplier_str.split(' - ')[0])
+
+        with get_connection() as conn:
+            cursor = conn.cursor()
+
+            # Record payment
+            cursor.execute('''
+                INSERT INTO payments (payment_type, reference_type, reference_id, amount,
+                                      payment_method, payment_date, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', ('made', 'supplier', supplier_id, amount, self.method_var.get(),
+                  date.today(), self.notes_var.get()))
+
+            # Update supplier balance
+            cursor.execute('UPDATE suppliers SET balance = balance - ? WHERE id = ?',
+                          (amount, supplier_id))
+
+            # If linked to purchase, update purchase
+            purchase_str = self.purchase_var.get()
+            if purchase_str:
+                invoice_no = purchase_str.split(' ')[0]
+                cursor.execute('''
+                    UPDATE purchases SET paid_amount = paid_amount + ? WHERE invoice_no = ?
+                ''', (amount, invoice_no))
+                cursor.execute('''
+                    UPDATE purchases SET status = 'paid' WHERE invoice_no = ? AND paid_amount >= total_amount
+                ''', (invoice_no,))
+
+            conn.commit()
+
+            # Record accounting entry
+            record_payment_made(supplier_id, amount, f'PMT-{supplier_id}')
+
+        messagebox.showinfo("Success", f"Payment of ${amount:.2f} made")
+        self.destroy()
 
 
 if __name__ == "__main__":
